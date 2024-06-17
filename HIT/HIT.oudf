@@ -1,0 +1,424 @@
+//
+@kernel void fillFUKernel(const dlong Ntotal,
+                    const dlong offset,
+                    @restrict const dfloat *forcing,
+                    @restrict dfloat * FU) { 
+  for (dlong n=0;n<Ntotal;++n;@tile(p_blockSize,@outer,@inner)) {
+    if (n<Ntotal) {
+      FU[n + 0*offset] = forcing[n + 0*offset];
+      FU[n + 1*offset] = forcing[n + 1*offset];
+      FU[n + 2*offset] = forcing[n + 2*offset];
+    }
+  }
+}
+
+@kernel void compCS(const dlong Nelements,
+                     const dlong uOffset,
+                     @restrict const dfloat* X,
+                     @restrict const dfloat* Y,
+                     @restrict const dfloat* Z,
+                     @restrict const dfloat* U,
+                     @restrict const dfloat* V,
+                     @restrict const dfloat* W,
+                     @restrict const dfloat* B,
+                     const dfloat Kx,
+                     const dfloat Ky,
+                     const dfloat Kz,
+                     const dfloat Lx,
+                     const dfloat Ly,
+                     const dfloat Lz,
+                     @restrict dfloat* cs)
+{
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const int id = e*p_Np + n;
+
+      dfloat argx = X[id]*2.0*M_PI*Kx/(Lx*1.0);
+      dfloat argy = Y[id]*2.0*M_PI*Ky/(Ly*1.0);
+      dfloat argz = Z[id]*2.0*M_PI*Kz/(Lz*1.0);
+
+      dfloat cx = cos(argx);
+      dfloat cy = cos(argy);
+      dfloat cz = cos(argz);
+      dfloat sx = sin(argx);
+      dfloat sy = sin(argy);
+      dfloat sz = sin(argz);
+
+      cs[id + 0*uOffset] = sx*sy*sz;
+      cs[id + 1*uOffset] = sx*sy*cz;
+      cs[id + 2*uOffset] = sx*cy*sz;
+      cs[id + 3*uOffset] = sx*cy*cz;
+      cs[id + 4*uOffset] = cx*sy*sz;
+      cs[id + 5*uOffset] = cx*sy*cz;
+      cs[id + 6*uOffset] = cx*cy*sz;
+      cs[id + 7*uOffset] = cx*cy*cz;
+
+    }
+  }
+}
+
+@kernel void compFU(const dlong Nelements,
+                     const dlong uOffset,
+                     const dfloat ucs,
+                     const dfloat vcs,
+                     const dfloat wcs,
+                     @restrict const dfloat* csl,
+                     @restrict dfloat* force)
+{
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const int id = e*p_Np + n;
+
+      force[id + 0*uOffset] = force[id + 0*uOffset] + csl[id]*ucs;
+      force[id + 1*uOffset] = force[id + 1*uOffset] + csl[id]*vcs;
+      force[id + 2*uOffset] = force[id + 2*uOffset] + csl[id]*wcs;
+    }
+  }
+}
+
+@kernel void copyker(const dlong Nelements,
+                     @restrict const dfloat* X,
+                     @restrict dfloat* Y)
+{
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const int id = e*p_Np + n;
+      Y[id] = X[id];
+    }
+  }
+}
+
+@kernel void myDiss(const dlong Nelements,
+                                    @restrict const dfloat*  vgeo,
+                                    @restrict const dfloat*  D,
+                                    const dlong offset,
+                                    @restrict const dfloat*  viscosity,
+                                    @restrict const dfloat*  U,
+                                    @restrict dfloat*  dis)
+{
+  for(dlong e = 0; e < Nelements; e++; @outer(0)) { // for all elements
+    @shared dfloat s_U[p_Nq][p_Nq];
+    @exclusive dfloat s_Uloc[p_Nq];
+
+    @shared dfloat s_V[p_Nq][p_Nq];
+    @exclusive dfloat s_Vloc[p_Nq];
+
+    @shared dfloat s_W[p_Nq][p_Nq];
+    @exclusive dfloat s_Wloc[p_Nq];
+
+    @shared dfloat s_D[p_Nq][p_Nq];
+
+#ifdef smXX
+    #pragma unroll p_Nq
+#endif
+    for(int k = 0; k < p_Nq; ++k){
+      for(int j = 0; j < p_Nq; ++j; @inner(1)){
+        for(int i = 0; i < p_Nq; ++i; @inner(0)) {
+          const dlong id = e * p_Np + k * p_Nq * p_Nq + j * p_Nq + i;
+
+          s_U[j][i]  = U[id + 0 * offset];
+          s_V[j][i]  = U[id + 1 * offset];
+          s_W[j][i]  = U[id + 2 * offset];
+
+          if (k == 0)
+            s_D[j][i] = D[j * p_Nq + i];
+          if(k == 0){
+            #pragma unroll p_Nq
+            for(int l = 0 ; l < p_Nq; ++l){
+              const dlong other_id = e * p_Np + l * p_Nq * p_Nq + j * p_Nq + i;
+              s_Uloc[l] = U[other_id + 0 * offset];
+              s_Vloc[l] = U[other_id + 1 * offset];
+              s_Wloc[l] = U[other_id + 2 * offset];
+            }
+          }
+        }
+      }
+
+
+    // Make sure all node data is loaded into @shared
+//    @barrier("local");
+    @barrier();
+      for(int j = 0; j < p_Nq; ++j; @inner(1)) {
+        for(int i = 0; i < p_Nq; ++i; @inner(0)) {
+          const dlong gid = e * p_Np * p_Nvgeo + k * p_Nq * p_Nq + j * p_Nq + i;
+          const dfloat drdx = vgeo[gid + p_RXID * p_Np];
+          const dfloat drdy = vgeo[gid + p_RYID * p_Np];
+          const dfloat drdz = vgeo[gid + p_RZID * p_Np];
+          const dfloat dsdx = vgeo[gid + p_SXID * p_Np];
+          const dfloat dsdy = vgeo[gid + p_SYID * p_Np];
+          const dfloat dsdz = vgeo[gid + p_SZID * p_Np];
+          const dfloat dtdx = vgeo[gid + p_TXID * p_Np];
+          const dfloat dtdy = vgeo[gid + p_TYID * p_Np];
+          const dfloat dtdz = vgeo[gid + p_TZID * p_Np];
+          const dfloat JW   = vgeo[gid + p_JWID * p_Np];
+
+          dfloat dUdr  = 0.f, dUds  = 0.f, dUdt  = 0.f;
+          dfloat dVdr  = 0.f, dVds  = 0.f, dVdt  = 0.f;
+          dfloat dWdr  = 0.f, dWds  = 0.f, dWdt  = 0.f;
+
+#pragma unroll p_Nq
+          for(int n = 0; n < p_Nq; ++n) {
+            const dfloat Dr = s_D[i][n];
+            const dfloat Ds = s_D[j][n];
+            const dfloat Dt = s_D[k][n];
+
+            dUdr += Dr * s_U[j][n];
+            dUds += Ds * s_U[n][i];
+            dUdt += Dt * s_Uloc[n];
+
+            dVdr += Dr * s_V[j][n];
+            dVds += Ds * s_V[n][i];
+            dVdt += Dt * s_Vloc[n];
+
+            dWdr += Dr * s_W[j][n];
+            dWds += Ds * s_W[n][i];
+            dWdt += Dt * s_Wloc[n];
+          }
+
+          const dlong id = e * p_Np + k * p_Nq * p_Nq + j * p_Nq + i;
+          const dfloat mu = viscosity[id];
+          const dfloat multiplier = 1.0;
+
+          dfloat dUdx = multiplier * (drdx * dUdr + dsdx * dUds + dtdx * dUdt);
+          dfloat dUdy = multiplier * (drdy * dUdr + dsdy * dUds + dtdy * dUdt);
+          dfloat dUdz = multiplier * (drdz * dUdr + dsdz * dUds + dtdz * dUdt);
+          dfloat dVdx = multiplier * (drdx * dVdr + dsdx * dVds + dtdx * dVdt);
+          dfloat dVdy = multiplier * (drdy * dVdr + dsdy * dVds + dtdy * dVdt);
+          dfloat dVdz = multiplier * (drdz * dVdr + dsdz * dVds + dtdz * dVdt);
+          dfloat dWdx = multiplier * (drdx * dWdr + dsdx * dWds + dtdx * dWdt);
+          dfloat dWdy = multiplier * (drdy * dWdr + dsdy * dWds + dtdy * dWdt);
+          dfloat dWdz = multiplier * (drdz * dWdr + dsdz * dWds + dtdz * dWdt);
+
+          dfloat dUdx2 = dUdx*dUdx;
+          dfloat dUdy2 = dUdy*dUdy;                         
+          dfloat dUdz2 = dUdz*dUdz;                         
+          dfloat dVdx2 = dVdx*dVdx;                         
+          dfloat dVdy2 = dVdy*dVdy;                         
+          dfloat dVdz2 = dVdz*dVdz;                         
+          dfloat dWdx2 = dWdx*dWdx;                         
+          dfloat dWdy2 = dWdy*dWdy;                         
+          dfloat dWdz2 = dWdz*dWdz;
+
+          dfloat TKE = dUdx2 + dUdy2 + dUdz2 + dVdx2 + dVdy2 + dVdz2 + dWdx2 + dWdy2 + dWdz2;
+          dis[id] = mu*TKE;
+        }
+      }
+//      @barrier("local");
+      @barrier();
+    } // k-loop
+  }
+}
+
+@kernel void compMag(const dlong Nelements,
+                     const dlong uOffset,
+                     const dfloat mean,
+                     @restrict const dfloat* U,
+                     @restrict dfloat* mag)
+{
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const int id = e*p_Np + n;
+
+      const dfloat ux = U[id + 0*uOffset];
+      const dfloat uy = U[id + 1*uOffset];
+      const dfloat uz = U[id + 2*uOffset];
+
+      mag[id] = sqrt(ux*ux + uy*uy + uz*uz) - mean;
+    }
+  }
+}
+
+
+@kernel void compS(const dlong Nelements,
+                     const dlong uOffset,
+                     const dfloat patm1,
+                     @restrict const dfloat* Temp,
+                     @restrict dfloat* S1,
+                     @restrict dfloat* S2,
+                     @restrict dfloat* S3,
+                     @restrict dfloat* S4)
+{
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const int id = e*p_Np + n;
+
+      const dfloat es = 2.53e11*exp(-5.42e3/Temp[id]);
+      const dfloat qs = 0.622*es/(patm1+es);
+      const dfloat qv = S1[id];
+      S2[id] = es;
+      S3[id] = qs;
+      S4[id] = qv/qs - 1.0;
+    }
+  }
+}
+
+@kernel void particleRHS(const dlong N,
+                         const dlong offset,
+                         const dfloat visc,
+                         const dfloat Dp,
+                         const dfloat rhop,
+                         @ restrict const dfloat *y,
+                         @ restrict dfloat *prop,
+                         @ restrict const dfloat *U,
+                         @ restrict dfloat *Force,
+                         @ restrict dfloat *ydot)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    const dfloat xx = y[n + 0 * offset];
+    const dfloat yy = y[n + 1 * offset];
+    const dfloat zz = y[n + 2 * offset];
+
+    const dfloat vx = y[n + 3 * offset];
+    const dfloat vy = y[n + 4 * offset];
+    const dfloat vz = y[n + 5 * offset];
+
+    const dfloat Ux = U[n + 0 * offset];
+    const dfloat Uy = U[n + 1 * offset];
+    const dfloat Uz = U[n + 2 * offset];
+
+    const dfloat vel2 = (Ux - vx)*(Ux - vx) + (Uy - vy)*(Uy - vy) + (Uz - vz)*(Uz - vz);
+    const dfloat vel = sqrt(vel2);
+    const dfloat Rep = vel*Dp/visc;
+
+    if(Rep <= 1000){
+      prop[n] = rhop * Dp * Dp / (18 * visc * (1 + 0.15*pow(Rep,0.687)));
+    } else{
+      prop[n] = rhop * Dp / (0.33 * vel);
+    }
+
+    const dfloat Stk = prop[n];
+    const dfloat invStk = 1.0 / Stk;
+
+    // dx_i/dt = v_i
+    ydot[n + 0 * offset] = vx;
+    ydot[n + 1 * offset] = vy;
+    ydot[n + 2 * offset] = vz;
+
+/*
+    ydot[n + 0 * offset] = Ux;
+    ydot[n + 1 * offset] = Uy;
+    ydot[n + 2 * offset] = Uz;
+*/
+
+    // dv_i/dt = 1/Stk * (U_i - v_i)
+    ydot[n + 3 * offset] = invStk * (Ux - vx);
+    ydot[n + 4 * offset] = invStk * (Uy - vy);
+    ydot[n + 5 * offset] = invStk * (Uz - vz);
+
+    Force[n + 0 * offset] = invStk * (Ux - vx);
+    Force[n + 1 * offset] = invStk * (Uy - vy);
+    Force[n + 2 * offset] = invStk * (Uz - vz);
+  }
+}
+
+@kernel void particlePeriodicity(const dlong N,
+                         const dlong offset,
+                         const dfloat xmn,
+                         const dfloat xmx,
+                         const dfloat ymn,
+                         const dfloat ymx,
+                         const dfloat zmn,
+                         const dfloat zmx,
+                         @ restrict dfloat *y)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    dfloat xx = y[n + 0 * offset];
+    dfloat yy = y[n + 1 * offset];
+    dfloat zz = y[n + 2 * offset];
+
+    if(xx> xmx) y[n + 0 * offset] = xmn + (xx-xmx);
+    if(xx<=xmn) y[n + 0 * offset] = xmx + (xx-xmn);
+    if(yy> ymx) y[n + 1 * offset] = ymn + (yy-ymx);
+    if(yy<=ymn) y[n + 1 * offset] = ymx + (yy-ymn);
+    if(zz> zmx) y[n + 2 * offset] = zmn + (zz-zmx);
+    if(zz<=zmn) y[n + 2 * offset] = zmx + (zz-zmn);
+  }
+}
+
+@kernel void GHpos(const dlong N,
+                   const dlong offset,
+                   const dfloat delta,
+                   @ restrict dfloat *y,
+                   @ restrict dfloat *ghid)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    int id = (int) ghid[n + 0 * offset];
+    dfloat xx = y[n + 0 * offset];
+    dfloat yy = y[n + 1 * offset];
+    dfloat zz = y[n + 2 * offset];
+
+    if(id== 1) { y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz      ;}
+    if(id== 2) { y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz      ;}
+    if(id== 3) { y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz      ;}
+    if(id== 4) { y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz      ;}
+    if(id== 5) { y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz      ;}
+    if(id== 6) { y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz      ;}
+    if(id== 7) { y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz      ;}
+    if(id== 8) { y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz      ;}
+
+    if(id== 9) { y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz+delta;}
+    if(id== 10){ y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz+delta;}
+    if(id== 11){ y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz+delta;}
+    if(id== 12){ y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz+delta;}
+    if(id== 13){ y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz+delta;}
+    if(id== 14){ y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz+delta;}
+    if(id== 15){ y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz+delta;}
+    if(id== 16){ y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz+delta;}
+    if(id== 17){ y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz+delta;}
+
+    if(id== 18){ y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz-delta;}
+    if(id== 19){ y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz-delta;}
+    if(id== 20){ y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz-delta;}
+    if(id== 21){ y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz-delta;}
+    if(id== 22){ y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz-delta;}
+    if(id== 23){ y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz-delta;}
+    if(id== 24){ y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz-delta;}
+    if(id== 25){ y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz-delta;}
+    if(id== 26){ y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz-delta;}
+
+  }
+}
+
+@kernel void GHposBack(const dlong N,
+                       const dlong offset,
+                       const dfloat delta,
+                       @ restrict dfloat *y,
+                       @ restrict dfloat *ghid)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    int id = (int) ghid[n + 0 * offset];
+    dfloat xx = y[n + 0 * offset];
+    dfloat yy = y[n + 1 * offset];
+    dfloat zz = y[n + 2 * offset];
+
+    if(id== 1) { y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz      ;}
+    if(id== 2) { y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz      ;}
+    if(id== 3) { y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz      ;}
+    if(id== 4) { y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz      ;}
+    if(id== 5) { y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz      ;}
+    if(id== 6) { y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz      ;}
+    if(id== 7) { y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz      ;}
+    if(id== 8) { y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz      ;}
+
+    if(id== 9) { y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz-delta;}
+    if(id== 10){ y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz-delta;}
+    if(id== 11){ y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz-delta;}
+    if(id== 12){ y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz-delta;}
+    if(id== 13){ y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz-delta;}
+    if(id== 14){ y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz-delta;}
+    if(id== 15){ y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz-delta;}
+    if(id== 16){ y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz-delta;}
+    if(id== 17){ y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz-delta;}
+
+    if(id== 18){ y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz+delta;}
+    if(id== 19){ y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz+delta;}
+    if(id== 20){ y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy      ; y[n + 2 * offset] = zz+delta;}
+    if(id== 21){ y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz+delta;}
+    if(id== 22){ y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz+delta;}
+    if(id== 23){ y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy-delta; y[n + 2 * offset] = zz+delta;}
+    if(id== 24){ y[n + 0 * offset] = xx      ; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz+delta;}
+    if(id== 25){ y[n + 0 * offset] = xx-delta; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz+delta;}
+    if(id== 26){ y[n + 0 * offset] = xx+delta; y[n + 1 * offset] = yy+delta; y[n + 2 * offset] = zz+delta;}
+
+  }
+}

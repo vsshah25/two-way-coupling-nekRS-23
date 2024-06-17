@@ -1,0 +1,230 @@
+// Boundary conditions
+void velocityDirichletConditions(bcData *bc)
+{
+  bc->u = 1.0;
+  bc->v = 0.0;
+  bc->w = 0.0;
+}
+
+void scalarDirichletConditions(bcData *bc) {
+  bc->s = 0.0;
+} 
+
+@kernel void fillFU(const dlong Ntotal,
+                    const dlong offset,
+                    @restrict const dfloat *meshID,
+                    @restrict const dfloat *FX,
+                    @restrict const dfloat *FY,
+                    @restrict const dfloat *FZ,
+                    @restrict dfloat * FU) {
+  for (dlong n=0;n<Ntotal;++n;@tile(p_blockSize,@outer,@inner)) {
+    if (n<Ntotal) {
+      dfloat R = 0.1;
+      dfloat vol = 4.0/3.0*M_PI*R*R*R;
+      FU[(int)meshID[n] + 0*offset] = -1.0*FX[n]*vol;
+      FU[(int)meshID[n] + 1*offset] = -1.0*FY[n]*vol;
+      FU[(int)meshID[n] + 2*offset] = -1.0*FZ[n]*vol;
+    }
+  }
+}
+
+@kernel void particleRHS(const dlong N,
+                         const dlong offset,
+                         @ restrict const dfloat *y,
+                         @ restrict const dfloat *prop,
+                         @ restrict const dfloat *U,
+                         @ restrict dfloat *Force,
+                         @ restrict dfloat *ydot)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    const dfloat xx = y[n + 0 * offset];
+    const dfloat yy = y[n + 1 * offset];
+    const dfloat zz = y[n + 2 * offset];
+
+    const dfloat vx = y[n + 3 * offset];
+    const dfloat vy = y[n + 4 * offset];
+    const dfloat vz = y[n + 5 * offset];
+
+    const dfloat Ux = U[n + 0 * offset];
+    const dfloat Uy = U[n + 1 * offset];
+    const dfloat Uz = U[n + 2 * offset];
+
+    const dfloat Stk = prop[n];
+    const dfloat invStk = 1.0 / Stk;
+
+    // dx_i/dt = v_i
+    ydot[n + 0 * offset] = vx;
+    ydot[n + 1 * offset] = vy;
+    ydot[n + 2 * offset] = vz;
+
+    // dv_i/dt = 1/Stk * (U_i - v_i)
+    ydot[n + 3 * offset] = invStk * (Ux - vx);
+    ydot[n + 4 * offset] = invStk * (Uy - vy);
+    ydot[n + 5 * offset] = invStk * (Uz - vz);
+
+    Force[n + 0 * offset] = invStk * (Ux - vx);
+    Force[n + 1 * offset] = invStk * (Uy - vy);
+    Force[n + 2 * offset] = invStk * (Uz - vz);
+
+/*
+    ydot[n + 0 * offset] = 0.0; //vx;
+    ydot[n + 1 * offset] = 0.0; //vy;
+    ydot[n + 2 * offset] = 0.0; //vz;
+
+    // dv_i/dt = 1/Stk * (U_i - v_i)
+    ydot[n + 3 * offset] = 0.0; //invStk * (Ux - vx);
+    ydot[n + 4 * offset] = 0.0; //invStk * (Uy - vy);
+    ydot[n + 5 * offset] = 0.0; //invStk * (Uz - vz);
+*/
+
+  }
+}
+
+@kernel void particlePeriodicity(const dlong N,
+                         const dlong offset,
+                         const dfloat xmn,
+                         const dfloat xmx,
+                         const dfloat ymn,
+                         const dfloat ymx,
+                         const dfloat zmn,
+                         const dfloat zmx,
+                         @ restrict dfloat *y)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    dfloat xx = y[n + 0 * offset];
+    dfloat yy = y[n + 1 * offset];
+    dfloat zz = y[n + 2 * offset];
+
+    if(xx> xmx) y[n + 0 * offset] = xmn + (xx-xmx);
+    if(xx<=xmn) y[n + 0 * offset] = xmx + (xx-xmn);
+    if(yy> ymx) y[n + 1 * offset] = ymn + (yy-ymx);
+    if(yy<=ymn) y[n + 1 * offset] = ymx + (yy-ymn);
+    if(zz> zmx) y[n + 2 * offset] = zmn + (zz-zmx);
+    if(zz<=zmn) y[n + 2 * offset] = zmx + (zz-zmn);
+  }
+}
+
+@kernel void ParticleTID(const dlong N,
+                     const dlong offset,
+                     const dfloat xmn,
+                     const dfloat xmx,
+                     const dfloat ymn,
+                     const dfloat ymx,
+                     const dfloat zmn,
+                     const dfloat zmx,
+                     @ restrict dfloat *y,
+                     @ restrict dfloat *transferID)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    dfloat xx = y[n + 0 * offset];
+    dfloat yy = y[n + 1 * offset];
+    dfloat zz = y[n + 2 * offset];
+
+    dfloat xhl = (xmn+xmx)/2.0;
+
+    if(xx<=xhl){
+      dfloat tid = 0.0;
+      transferID[n + 0 * offset] = tid;
+    } 
+    else if(xx> xhl){
+      dfloat tid = 1.0;
+      transferID[n + 0 * offset] = tid;
+    }
+
+  }
+}
+
+@kernel void MeshPID(const dlong N,
+                     const dlong offset,
+                     const dfloat xmn,
+                     const dfloat xmx,
+                     const dfloat ymn,
+                     const dfloat ymx,
+                     const dfloat zmn,
+                     const dfloat zmx,
+                     const dfloat pid,
+                     @ restrict dfloat *y,
+                     @ restrict dfloat *presentID,
+                     @ restrict dfloat *transferID,
+                     @ restrict dfloat *meshID)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    dfloat xx = y[n + 0 * offset];
+    dfloat yy = y[n + 1 * offset];
+    dfloat zz = y[n + 2 * offset];
+
+    dfloat xhl = (xmn+xmx)/2.0;
+    meshID[n + 0 * offset] = (dfloat) n;
+
+    if(xx<=xhl){
+      dfloat tid = 0.0;
+      presentID[n + 0 * offset] = pid;
+      transferID[n + 0 * offset] = tid;
+    } 
+    else if(xx> xhl){
+      dfloat tid = 1.0;
+      presentID[n + 0 * offset] = pid;
+      transferID[n + 0 * offset] = tid;
+    }
+
+  }
+}
+
+@kernel void MeshForce(const dlong Nmesh,
+                       const dlong Np,
+                       const dlong Ng,
+                       const dlong offset_ms,
+                       const dlong offset_p,
+                       const dlong offset_gh,
+                       const dfloat delta2,
+                       @ restrict dfloat *y_ms,
+                       @ restrict dfloat *y_p,
+                       @ restrict dfloat *y_gh,
+                       @ restrict dfloat *TID,
+                       @ restrict dfloat *PID,
+                       @ restrict dfloat *Force,
+                       @ restrict dfloat *F_p,
+                       @ restrict dfloat *F_gh)
+{
+  for (dlong n = 0; n < Nmesh; ++n; @tile(p_blockSize, @outer, @inner)) {
+
+//    TID[n] = PID[n];
+
+    dfloat xms = y_ms[n + 0 * offset_ms];
+    dfloat yms = y_ms[n + 1 * offset_ms];
+    dfloat zms = y_ms[n + 2 * offset_ms];
+
+    Force[n + 0 * offset_ms] = 0.0;
+    Force[n + 1 * offset_ms] = 0.0;
+    Force[n + 2 * offset_ms] = 0.0;
+
+    for(dlong np = 0; np < Np; ++np){
+      dfloat xp = y_p[np + 0 * offset_p];
+      dfloat yp = y_p[np + 1 * offset_p];
+      dfloat zp = y_p[np + 2 * offset_p];
+
+      dfloat r2 = (xms-xp)*(xms-xp) + (yms-yp)*(yms-yp) + (zms-zp)*(zms-zp);
+      if(r2<=delta2*1.5*1.5){
+        dfloat val = pow(sqrt(M_PI*delta2/4.0/log(2.0)),-3.0)*exp(-1.0*r2/delta2*4*log(2.0));
+        Force[n + 0 * offset_ms] += F_p[np + 0 * offset_p]*val;
+        Force[n + 1 * offset_ms] += F_p[np + 1 * offset_p]*val;
+        Force[n + 2 * offset_ms] += F_p[np + 2 * offset_p]*val;
+      }
+    }
+
+    for(dlong ng = 0; ng < Ng; ++ng){
+      dfloat xg = y_gh[ng + 0 * offset_gh];
+      dfloat yg = y_gh[ng + 1 * offset_gh];
+      dfloat zg = y_gh[ng + 2 * offset_gh];
+
+      dfloat r2 = (xms-xg)*(xms-xg) + (yms-yg)*(yms-yg) + (zms-zg)*(zms-zg);
+      if(r2<=delta2*1.5*1.5){
+        dfloat val = pow(sqrt(M_PI*delta2/4.0/log(2.0)),-3.0)*exp(-1.0*r2/delta2*4*log(2.0));
+        Force[n + 0 * offset_ms] += F_p[ng + 0 * offset_gh]*val;
+        Force[n + 1 * offset_ms] += F_p[ng + 1 * offset_gh]*val;
+        Force[n + 2 * offset_ms] += F_p[ng + 2 * offset_gh]*val;
+      }
+    }
+
+  }
+}

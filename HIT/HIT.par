@@ -1,0 +1,62 @@
+#
+# nek parameter file
+#
+
+[GENERAL] 
+polynomialOrder = 4
+startFrom = restart.fld
+stopAt = numSteps
+numSteps = 500
+#numSteps = 15
+
+dt = 1.00e-3
+timeStepper = bdf3
+#extrapolation = OIFS
+
+writeControl = steps
+writeInterval = 50
+#writeInterval = 5
+
+#filtering = hpfrt
+#filterWeight = 10
+#filterCutoffRatio = 0.9 
+
+#[PROBLEMTYPE]
+#equation = incompNS
+
+[PRESSURE]
+residualTol = 1e-8
+#residualProjection = yes
+
+[VELOCITY]
+#boundaryTypeMap = none 
+density = 1.05
+viscosity = 1.56200e-5
+residualTol = 1e-12
+
+[TEMPERATURE]
+#boundaryTypeMap = none 
+rhoCp = 1.2
+conductivity=2.22e-5
+
+[SCALAR01]
+rho = 1.05
+diffusivity = 2.55e-5
+
+[SCALAR02]
+solver=none
+
+[SCALAR03]
+solver=none
+
+[SCALAR04]
+solver=none
+
+[CASEDATA]
+# inject nParticlesInject particles every injectionFrequency time steps
+nParticlesInject = 1024
+injectionFrequency = 50000000
+Stk = 0.00037037
+rhop = 1.0
+Dp = 0.0008
+#Stk = 0.005

@@ -1,0 +1,610 @@
+//
+// nekRS User Defined File
+//
+
+#include <math.h>
+#include "udf.hpp"
+#include "plugins/lpm.hpp"
+#include "linspaceVector.hpp"
+
+
+#ifdef __okl__
+
+#include "HIT.oudf"
+
+#endif
+
+const int Niii = 4;
+const dfloat kiii[Niii] = {-2.0, -1.0, 1.0, 2.0};
+
+//const int Niii = 1;
+//const dfloat kiii[Niii] = {1.0};
+
+dfloat ucs[Niii][Niii][Niii][8];
+dfloat vcs[Niii][Niii][Niii][8];
+dfloat wcs[Niii][Niii][Niii][8];
+dfloat uuu[Niii][Niii][Niii][8];
+dfloat vvv[Niii][Niii][Niii][8];
+dfloat www[Niii][Niii][Niii][8];
+
+int itk,kx,ky,kz,kxi,kyi,kzi;
+
+dfloat xmn, xmx, ymn, ymx, zmn, zmx;
+dfloat xlen, ylen, zlen;
+dfloat eps;
+dfloat utot, utot_inv,myvol;
+
+static dfloat visc;
+
+occa::memory o_cs;
+occa::memory o_force;
+occa::memory o_diss;
+occa::memory o_umag;
+
+static dfloat Stk;
+static dfloat rhop;
+static dfloat Dp;
+static occa::memory o_yNewPart; // for adding new particles
+static occa::memory o_propNewPart;
+
+static occa::memory o_Fparticles;
+
+static dfloat xMin, xMin_l, xMin_d;
+static dfloat yMin, yMin_l, yMin_d;
+static dfloat zMin, zMin_l, zMin_d;
+static dfloat xMax, xMax_l, xMax_d;
+static dfloat yMax, yMax_l, yMax_d;
+static dfloat zMax, zMax_l, zMax_d;
+
+static lpm_t *particles = nullptr;
+static lpm_t *particles_gh = nullptr;
+
+static dfloat delta=0.0024;
+static dfloat delta_sf=1.1;
+static dfloat delta2;
+
+static occa::memory o_scratch;
+static occa::memory h_scratch;
+dfloat* scratch;
+
+// \min o_a locally
+dfloat lmin(const dlong N, occa::memory &o_a)
+{
+  int blocksize = BLOCKSIZE; 
+  int Nblock = (N + blocksize - 1) / blocksize;
+  const size_t Nbytes = Nblock * sizeof(dfloat);
+
+  if (o_scratch.size() < Nbytes){
+
+    device_t &device = platform->device;
+    if (h_scratch.size())
+      h_scratch.free();
+    if (o_scratch.size())
+      o_scratch.free();
+    // pinned scratch buffer
+    {
+      h_scratch = device.mallocHost(Nbytes);
+      scratch = (dfloat *)h_scratch.ptr();
+    }
+    o_scratch = device.malloc(Nbytes);
+
+  }
+  
+  if (N > 1) {
+    platform->linAlg->minKernel(Nblock, N, o_a, o_scratch);
+
+    o_scratch.copyTo(scratch, Nbytes);
+  }
+  else {
+    o_a.copyTo(scratch, Nbytes);
+  }
+
+  dfloat min = scratch[0];
+  for (dlong n = 1; n < Nblock; ++n) {
+    min = (scratch[n] < min) ? scratch[n] : min;
+  }
+
+  return min;
+}
+
+// \max o_a locally
+dfloat lmax(const dlong N, occa::memory &o_a)
+{
+  int blocksize = BLOCKSIZE; 
+  int Nblock = (N + blocksize - 1) / blocksize;
+  const size_t Nbytes = Nblock * sizeof(dfloat);
+
+  if (o_scratch.size() < Nbytes){
+
+    device_t &device = platform->device;
+    if (h_scratch.size())
+      h_scratch.free();
+    if (o_scratch.size())
+      o_scratch.free();
+    // pinned scratch buffer
+    {
+      h_scratch = device.mallocHost(Nbytes);
+      scratch = (dfloat *)h_scratch.ptr();
+    }
+    o_scratch = device.malloc(Nbytes);
+
+  }
+  
+  if (N > 1) {
+    platform->linAlg->maxKernel(Nblock, N, o_a, o_scratch);
+
+    o_scratch.copyTo(scratch, Nbytes);
+  }
+  else {
+    o_a.copyTo(scratch, Nbytes);
+  }
+
+  dfloat max = scratch[0];
+  for (dlong n = 1; n < Nblock; ++n) {
+    max = (scratch[n] > max) ? scratch[n] : max;
+  }
+
+  return max;
+}
+
+void userf(nrs_t *nrs, dfloat time, occa::memory o_U, occa::memory o_FU)
+{
+  mesh_t* mesh = nrs->meshV;
+  fillFUKernel(mesh->Nlocal, nrs->fieldOffset, o_force, nrs->o_FU);
+}
+
+/* UDF Functions */                                                      
+
+void UDF_Setup0(MPI_Comm comm, setupAide &options)
+{
+  int commSize;
+  MPI_Comm_size(comm, &commSize);
+
+  int rank;
+  MPI_Comm_rank(comm, &rank);
+
+  platform->par->extract("casedata", "stk",  Stk);
+  platform->par->extract("casedata", "rhop", rhop);
+  platform->par->extract("casedata", "Dp",   Dp);
+
+  options.getArgs("VISCOSITY", visc);
+}
+
+void userRHS(nrs_t *nrs, lpm_t *lpm, dfloat time, occa::memory o_y, void *userdata, occa::memory o_ydot)
+{
+  auto offset = lpm->fieldOffset();
+
+  // evaluate fluid fields at particle positions
+  lpm->interpolate();
+
+  auto o_Uinterp = lpm->getInterpField("fluid_velocity");
+  auto o_projF   = lpm->getProp("forcex");
+
+  if (lpm->numParticles()) {
+    particleRHS(lpm->numParticles(), offset, visc, Dp, rhop,  o_y, lpm->o_prop, o_Uinterp, o_projF, o_ydot);
+  }
+}
+
+void userStRHS(nrs_t *nrs, lpm_t *lpm, dfloat time, occa::memory o_y, void *userdata, occa::memory o_ydot)
+{
+  platform->linAlg->fill(lpm->numParticles()*lpm->nDOFs(), 0.0, o_ydot);
+}
+
+auto generateInflowPoints(nrs_t *nrs)
+{
+  auto numGlobalParticles = particles->numGlobalParticles();
+
+  std::vector<dfloat> xPart, yPart, zPart;
+
+  auto mesh = nrs->meshV;
+
+//  const auto py = static_cast<int>(std::round(std::sqrt(nParticlesInject)));
+
+  const auto px = 36;
+  const auto py = 36;
+  const auto pz = 36;
+
+  for(int i=0; i<px; i++){
+    dfloat x = xmn + (i+0.5)/(1.0*px)*(xmx-xmn);
+  for(int j=0; j<py; j++){
+    dfloat y = ymn + (j+0.5)/(1.0*py)*(ymx-ymn);
+  for(int k=0; k<pz; k++){
+    dfloat z = zmn + (k+0.5)/(1.0*pz)*(zmx-zmn);
+
+    if (numGlobalParticles % platform->comm.mpiCommSize == platform->comm.mpiRank) {
+      xPart.push_back(x);
+      yPart.push_back(y);
+      zPart.push_back(z);
+    }
+    numGlobalParticles++;
+  }
+  }
+  }
+
+  return std::make_tuple(xPart, yPart, zPart);
+}
+
+void UDF_Setup(nrs_t *nrs)
+{
+  mesh_t *mesh = nrs->meshV;
+  udf.uEqnSource = &userf;
+
+  o_Fparticles =  platform->device.malloc(nrs->NVfields * nrs->fieldOffset, sizeof(dfloat));
+
+  xmn = platform->linAlg->min(mesh->Nlocal, mesh->o_x, platform->comm.mpiComm);
+  xmx = platform->linAlg->max(mesh->Nlocal, mesh->o_x, platform->comm.mpiComm);
+  ymn = platform->linAlg->min(mesh->Nlocal, mesh->o_y, platform->comm.mpiComm);
+  ymx = platform->linAlg->max(mesh->Nlocal, mesh->o_y, platform->comm.mpiComm);
+  zmn = platform->linAlg->min(mesh->Nlocal, mesh->o_z, platform->comm.mpiComm);
+  zmx = platform->linAlg->max(mesh->Nlocal, mesh->o_z, platform->comm.mpiComm);
+  xlen = xmx-xmn;
+  ylen = ymx-ymn;
+  zlen = zmx-zmn;
+  eps  = 161.0/100.0/100.0; 
+
+  o_cs    = platform->device.malloc(nrs->fieldOffset * 8, sizeof(dfloat));
+  o_force = platform->device.malloc(nrs->fieldOffset * 3, sizeof(dfloat));
+  o_diss  = platform->device.malloc(nrs->fieldOffset * 1, sizeof(dfloat));
+  o_umag  = platform->device.malloc(nrs->fieldOffset * 1, sizeof(dfloat));
+
+  xMin_l = lmin(mesh->Nlocal, mesh->o_x); 
+  yMin_l = lmin(mesh->Nlocal, mesh->o_y); 
+  zMin_l = lmin(mesh->Nlocal, mesh->o_z); 
+
+  xMax_l = lmax(mesh->Nlocal, mesh->o_x); 
+  yMax_l = lmax(mesh->Nlocal, mesh->o_y); 
+  zMax_l = lmax(mesh->Nlocal, mesh->o_z); 
+
+  xMin_d = xMin_l + delta;
+  yMin_d = yMin_l + delta;
+  zMin_d = zMin_l + delta;
+
+  xMax_d = xMax_l - delta;
+  yMax_d = yMax_l - delta;
+  zMax_d = zMax_l - delta;
+
+  const dfloat newton_tol = 5e-13;
+  const dfloat bb_tol = 1e-4;
+
+  particles = new lpm_t(nrs, bb_tol, newton_tol);
+  particles->setUserRHS(userRHS);
+
+  particles->setSolver("AB");
+
+  // register fluid velocity as an interpolated quantity
+  particles->registerInterpField("fluid_velocity", nrs->NVfields, nrs->o_U);
+
+  // register particle velocity as DOF
+  particles->registerDOF(nrs->NVfields, "velocity");
+
+  // register Stokes number as a property
+  particles->registerProp("stokes_number");
+  particles->registerProp("forcex");
+  particles->registerProp("forcey");
+  particles->registerProp("forcez");
+
+  auto [xPart, yPart, zPart] = generateInflowPoints(nrs);
+  const dlong nParticles = xPart.size();
+
+  // interpolate initial fluid velocity onto particle positions
+  std::vector<dfloat> particleU0(nrs->NVfields * nParticles);
+  auto interpolator = pointInterpolation_t(nrs);
+  interpolator.setPoints(nParticles, xPart.data(), yPart.data(), zPart.data());
+  interpolator.find();
+
+  interpolator.eval(nrs->NVfields, nrs->fieldOffset, nrs->U, nParticles, particleU0.data());
+
+  // set particle initial positions and velocities
+  std::vector<dfloat> y0(particles->nDOFs() * nParticles);
+
+  for (int pid = 0; pid < nParticles; ++pid) {
+    const auto x = xPart[pid];
+    const auto y = yPart[pid];
+    const auto z = zPart[pid];
+
+    const auto u = particleU0[pid + 0 * nParticles];
+    const auto v = particleU0[pid + 1 * nParticles];
+    const auto w = particleU0[pid + 2 * nParticles];
+
+    y0[pid + 0 * nParticles] = x;
+    y0[pid + 1 * nParticles] = y;
+    y0[pid + 2 * nParticles] = z;
+
+    y0[pid + 3 * nParticles] = u;
+    y0[pid + 4 * nParticles] = v;
+    y0[pid + 5 * nParticles] = w;
+  }
+
+  dfloat t0;
+  platform->options.getArgs("START TIME", t0);
+  particles->initialize(nParticles, t0, y0);
+
+  // set Stokes number
+  platform->linAlg->fill(nParticles, Stk, particles->o_prop);
+
+}
+
+void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
+{
+  mesh_t *mesh = nrs->meshV;
+  occa::memory o_UX = nrs->o_U + 0*nrs->fieldOffset * sizeof(dfloat);
+  occa::memory o_UY = nrs->o_U + 1*nrs->fieldOffset * sizeof(dfloat);
+  occa::memory o_UZ = nrs->o_U + 2*nrs->fieldOffset * sizeof(dfloat);
+
+  for(int i = 0; i < Niii; i++){
+  for(int j = 0; j < Niii; j++){
+  for(int k = 0; k < Niii; k++){
+  for(int l = 0; l < 8;    l++){
+    ucs[i][j][k][l] = 0.0;
+    vcs[i][j][k][l] = 0.0;
+    wcs[i][j][k][l] = 0.0;
+    uuu[i][j][k][l] = 0.0;
+    vvv[i][j][k][l] = 0.0;
+    www[i][j][k][l] = 0.0;
+  }
+  }
+  }
+  }
+
+  utot = 0.0;
+
+  for(int i = 0; i < Niii; i++){
+  for(int j = 0; j < Niii; j++){
+  for(int k = 0; k < Niii; k++){
+    compCS(mesh->Nelements,nrs->fieldOffset,mesh->o_x,mesh->o_y,mesh->o_z,o_UX,o_UY,o_UZ,mesh->o_LMM,
+           kiii[i], kiii[j], kiii[k], xlen, ylen, zlen, o_cs);
+    
+    for(int l = 0; l < 8;    l++){
+      occa::memory o_csl = o_cs + l*nrs->fieldOffset * sizeof(dfloat);
+
+      ucs[i][j][k][l] = ucs[i][j][k][l] + platform->linAlg->weightedInnerProd(mesh->Nlocal, o_csl, o_UX , mesh->o_LMM, platform->comm.mpiComm);
+      vcs[i][j][k][l] = vcs[i][j][k][l] + platform->linAlg->weightedInnerProd(mesh->Nlocal, o_csl, o_UY , mesh->o_LMM, platform->comm.mpiComm);
+      wcs[i][j][k][l] = wcs[i][j][k][l] + platform->linAlg->weightedInnerProd(mesh->Nlocal, o_csl, o_UZ , mesh->o_LMM, platform->comm.mpiComm);
+
+      uuu[i][j][k][l] = uuu[i][j][k][l] + platform->linAlg->weightedInnerProd(mesh->Nlocal, o_csl, o_csl, mesh->o_LMM, platform->comm.mpiComm);
+      vvv[i][j][k][l] = vvv[i][j][k][l] + platform->linAlg->weightedInnerProd(mesh->Nlocal, o_csl, o_csl, mesh->o_LMM, platform->comm.mpiComm);
+      www[i][j][k][l] = www[i][j][k][l] + platform->linAlg->weightedInnerProd(mesh->Nlocal, o_csl, o_csl, mesh->o_LMM, platform->comm.mpiComm);
+
+      ucs[i][j][k][l] = ucs[i][j][k][l]/uuu[i][j][k][l]/8.0;
+      vcs[i][j][k][l] = vcs[i][j][k][l]/vvv[i][j][k][l]/8.0;
+      wcs[i][j][k][l] = wcs[i][j][k][l]/www[i][j][k][l]/8.0;
+
+      utot = utot + ucs[i][j][k][l]*ucs[i][j][k][l] + vcs[i][j][k][l]*vcs[i][j][k][l] + wcs[i][j][k][l]*wcs[i][j][k][l];
+
+    }
+  }
+  }
+  }
+  
+  if (platform->comm.mpiRank == 0) printf("utot= %.16e  \n",utot);
+
+  utot_inv = 1.0/utot;
+
+  for(int i = 0; i < Niii; i++){
+  for(int j = 0; j < Niii; j++){
+  for(int k = 0; k < Niii; k++){
+  for(int l = 0; l < 8;    l++){
+    ucs[i][j][k][l] = ucs[i][j][k][l]*utot_inv*eps;
+    vcs[i][j][k][l] = vcs[i][j][k][l]*utot_inv*eps;
+    wcs[i][j][k][l] = wcs[i][j][k][l]*utot_inv*eps;
+  }
+  }
+  }
+  }
+
+  occa::memory o_FX = o_force + 0*nrs->fieldOffset * sizeof(dfloat);
+  occa::memory o_FY = o_force + 1*nrs->fieldOffset * sizeof(dfloat);
+  occa::memory o_FZ = o_force + 2*nrs->fieldOffset * sizeof(dfloat);
+
+  platform->linAlg->fill(mesh->Nlocal,0.0,o_FX);
+  platform->linAlg->fill(mesh->Nlocal,0.0,o_FY);
+  platform->linAlg->fill(mesh->Nlocal,0.0,o_FZ);
+
+  for(int i = 0; i < Niii; i++){
+  for(int j = 0; j < Niii; j++){
+  for(int k = 0; k < Niii; k++){
+    compCS(mesh->Nelements,nrs->fieldOffset,mesh->o_x,mesh->o_y,mesh->o_z,o_UX,o_UY,o_UZ,mesh->o_LMM,
+           kiii[i], kiii[j], kiii[k], xlen, ylen, zlen, o_cs);
+    for(int l = 0; l < 8;    l++){
+      occa::memory o_csl = o_cs + l*nrs->fieldOffset * sizeof(dfloat);
+      compFU(mesh->Nelements,nrs->fieldOffset,ucs[i][j][k][l],vcs[i][j][k][l],wcs[i][j][k][l],o_csl,o_force);
+    }
+  }
+  }
+  }
+
+  occa::memory o_PS0 = nrs->cds->o_S + 0*nrs->fieldOffset * sizeof(dfloat);
+  occa::memory o_PS1 = nrs->cds->o_S + 1*nrs->fieldOffset * sizeof(dfloat);
+  occa::memory o_PS2 = nrs->cds->o_S + 2*nrs->fieldOffset * sizeof(dfloat);
+  occa::memory o_PS3 = nrs->cds->o_S + 3*nrs->fieldOffset * sizeof(dfloat);
+  occa::memory o_PS4 = nrs->cds->o_S + 4*nrs->fieldOffset * sizeof(dfloat);
+
+  const dfloat patm1 = 101235.0;
+  compS(mesh->Nelements,nrs->fieldOffset,patm1,o_PS0,o_PS1,o_PS2,o_PS3,o_PS4);  
+
+  platform->linAlg->fill(mesh->Nlocal,0.0,o_diss);
+  myDiss(mesh->Nelements,mesh->o_vgeo,mesh->o_D,nrs->fieldOffset,nrs->o_mue,nrs->o_U,o_diss);
+  dfloat epss = platform->linAlg->innerProd(mesh->Nlocal, o_diss, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+  if (platform->comm.mpiRank == 0) printf("epsilon = %d %.16e %.16e\n",tstep,time,epss);
+
+
+  const dfloat vxa = platform->linAlg->innerProd(mesh->Nlocal, o_UX, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+  const dfloat vya = platform->linAlg->innerProd(mesh->Nlocal, o_UY, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+  const dfloat vza = platform->linAlg->innerProd(mesh->Nlocal, o_UZ, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+  const dfloat vx2 = platform->linAlg->weightedInnerProd(mesh->Nlocal, o_UX, o_UX, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+  const dfloat vy2 = platform->linAlg->weightedInnerProd(mesh->Nlocal, o_UY, o_UY, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+  const dfloat vz2 = platform->linAlg->weightedInnerProd(mesh->Nlocal, o_UZ, o_UZ, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+  dfloat tea = platform->linAlg->innerProd(mesh->Nlocal, o_PS0, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+  dfloat te2 = platform->linAlg->weightedInnerProd(mesh->Nlocal, o_PS0, o_PS0, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+
+  compMag(mesh->Nelements,nrs->fieldOffset,0.0,nrs->o_U,o_umag);
+  const dfloat vxaa = platform->linAlg->innerProd(mesh->Nlocal, o_umag, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+
+  compMag(mesh->Nelements,nrs->fieldOffset,vxaa,nrs->o_U,o_umag);
+//  const dfloat vxaa2 = platform->linAlg->innerProd(mesh->Nlocal, o_umag, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+  const dfloat vxaa2 = platform->linAlg->weightedInnerProd(mesh->Nlocal, o_umag, o_umag, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+
+  const dfloat tketa = 0.5*(vx2+vy2+vz2);
+  const dfloat u_rms = sqrt(tketa*2.0/3.0);
+
+  if (platform->comm.mpiRank == 0) {
+    printf("tke_t= %d %.16e %.16e\n",tstep,time,tketa);
+    printf("u_rms= %d %.16e %.16e\n",tstep,time,u_rms);
+    printf("umag_rms= %d %.16e %.16e\n",tstep,time,sqrt(vxaa2));
+    printf("ux_rms= %d %.16e %.16e\n",tstep,time,sqrt(vx2-vxa*vxa));
+    printf("uy_rms= %d %.16e %.16e\n",tstep,time,sqrt(vy2-vya*vya));
+    printf("uw_rms= %d %.16e %.16e\n",tstep,time,sqrt(vz2-vza*vza));
+    printf("U_rms= %d %.16e %.16e\n",tstep,time,(sqrt(vz2-vza*vza)+sqrt(vy2-vya*vya)+sqrt(vz2-vza*vza))/3.0);
+    printf("Tmean= %d %.16e %.16e\n",tstep,time,tea);
+    printf("T_rms= %d %.16e %.16e\n",tstep,time,te2-tea*tea);
+  }
+
+  tea = platform->linAlg->innerProd(mesh->Nlocal, o_PS3, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+  te2 = platform->linAlg->weightedInnerProd(mesh->Nlocal, o_PS3, o_PS3, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+  if (platform->comm.mpiRank == 0) {
+   printf("Smean= %d %.16e %.16e\n",tstep,time,tea);
+   printf("S_rms= %d %.16e %.16e\n",tstep,time,te2-tea*tea);
+  }
+  tea = platform->linAlg->innerProd(mesh->Nlocal, o_PS4, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+  te2 = platform->linAlg->weightedInnerProd(mesh->Nlocal, o_PS4, o_PS4, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+  if (platform->comm.mpiRank == 0) {
+    printf("Qmean= %d %.16e %.16e\n",tstep,time,tea);
+    printf("Q_rms= %d %.16e %.16e\n",tstep,time,te2-tea*tea);
+  }
+
+  epss = platform->linAlg->innerProd(mesh->Nlocal, o_diss, mesh->o_LMM, platform->comm.mpiComm)/mesh->volume;
+  dfloat lk = pow((pow(visc,3)/abs(epss)),(1.0/4.0)); 
+  dfloat tk = sqrt(visc/abs(epss));
+  dfloat Reyk = lk*u_rms/visc;
+
+  dfloat ltt= pow(((15.0*visc*u_rms*u_rms)/(abs(epss))),0.5);
+  dfloat ttt = ltt/u_rms;
+  dfloat Reytt = ltt*u_rms/visc;
+
+  dfloat Reykkk = pow((5.0/(3*visc*abs(epss))),0.5)*u_rms*u_rms;
+
+  if (platform->comm.mpiRank == 0) {
+    printf("Kolmogorov l, t, Rek= %d %.16e %.16e %.16e %.16e\n",tstep,time,lk, tk, Reyk);
+    printf("Taylor l, t, Ret= %d %.16e %.16e %.16e %.16e\n",tstep,time,ltt, ttt, Reytt);
+    printf("Re_t from Kumar= %d %.16e %.16e\n",tstep,time,Reykkk);
+  }
+
+  particles->integrate(time);
+
+  particlePeriodicity(particles->numParticles(),
+                      particles->fieldOffset(),
+                      xmn,xmx,ymn,ymx,zmn,zmx,
+                      particles->getDOF(0) );
+
+  particles->migrate();
+
+  // Ghost Particles creation
+  const dfloat newton_tol = 5e-13;
+  const dfloat bb_tol = 1e-4;
+
+  particles_gh = new lpm_t(nrs, bb_tol, newton_tol);
+  particles_gh->setUserRHS(userStRHS);
+  particles_gh->setSolver("AB");
+  particles_gh->registerDOF(nrs->NVfields, "force");
+  particles_gh->registerProp("ghid");
+
+  auto xPartgh = particles->getDOFHost("x");
+  auto yPartgh = particles->getDOFHost("y");
+  auto zPartgh = particles->getDOFHost("z");
+  auto FxPartgh = particles->getPropHost("forcex");
+  auto FyPartgh = particles->getPropHost("forcey");
+  auto FzPartgh = particles->getPropHost("forcez");
+  const dlong nParticles = particles->numParticles();
+
+  // set particle initial positions and velocities
+  std::vector< std::vector<dfloat>> y0gh(particles->nDOFs());
+  std::vector<dfloat> ghid;
+
+  for (int pid = 0; pid < nParticles; ++pid) {
+    const auto x = xPartgh[pid];
+    const auto y = yPartgh[pid];
+    const auto z = zPartgh[pid];
+
+    if(xMin_d<=x && x<=xMax_d && yMin_d<=y && y<=yMax_d && zMin_d<=z && z<=zMax_d) continue;
+
+    const auto fx = FxPartgh[pid];
+    const auto fy = FyPartgh[pid];
+    const auto fz = FzPartgh[pid];
+
+
+    int ctr = 0;
+
+    if(x>xMax_d){ ghid.push_back(1.0); ctr++;
+      if(y>yMax_d){ ghid.push_back(4.0); ctr++;
+        if(z>zMax_d){ ghid.push_back(13.0); ctr++;}
+        if(z<zMin_d){ ghid.push_back(22.0); ctr++;}
+      } 
+      if(y<yMin_d){ ghid.push_back(7.0); ctr++;
+        if(z>zMax_d){ ghid.push_back(16.0); ctr++;}
+        if(z<zMin_d){ ghid.push_back(25.0); ctr++;}
+      } 
+      
+      if(z>zMax_d){ ghid.push_back(10.0); ctr++;}
+      if(z<zMin_d){ ghid.push_back(19.0); ctr++;}
+    } 
+    
+    if(x<xMin_d){ ghid.push_back(2.0); ctr++;
+      if(y>yMax_d){ ghid.push_back(5.0); ctr++;
+        if(z>zMax_d){ ghid.push_back(14.0); ctr++;}
+        if(z<zMin_d){ ghid.push_back(23.0); ctr++;}
+      } 
+      if(y<yMin_d){ ghid.push_back(8.0); ctr++;
+        if(z>zMax_d){ ghid.push_back(17.0); ctr++;}
+        if(z<zMin_d){ ghid.push_back(26.0); ctr++;}
+      } 
+      if(z>zMax_d){ ghid.push_back(11.0); ctr++;}
+      if(z<zMin_d){ ghid.push_back(20.0); ctr++;}
+    } 
+    if(y>yMax_d){ ghid.push_back(3.0); ctr++;
+      if(z>zMax_d){ ghid.push_back(12.0); ctr++;}
+      if(z<zMin_d){ ghid.push_back(21.0); ctr++;}
+    } 
+    if(y<yMin_d){ ghid.push_back(6.0); ctr++;
+      if(z>zMax_d){ ghid.push_back(15.0); ctr++;}
+      if(z<zMin_d){ ghid.push_back(24.0); ctr++;}
+    } 
+    if(z>zMax_d){ ghid.push_back(9.0); ctr++;}
+    if(z<zMin_d){ ghid.push_back(18.0); ctr++;}
+
+    for(int i=0; i<ctr; i++){ 
+      y0gh[0].push_back(x);
+      y0gh[1].push_back(y);
+      y0gh[2].push_back(z);
+      y0gh[3].push_back(fx);
+      y0gh[4].push_back(fy);
+      y0gh[5].push_back(fz);
+    }
+  }
+
+  const dlong nParticlesgh = ghid.size();
+  std::vector<dfloat> y0gh2;
+
+  for(int i=0; i<6; i++){
+    y0gh2.insert( y0gh2.end(), y0gh[i].begin(), y0gh[i].end() );
+  }
+
+  dfloat t0 = time;
+  particles_gh->initialize(nParticlesgh, t0, y0gh2);
+  particles_gh->o_prop.copyFrom(ghid.data(), ghid.size() * sizeof(dfloat)); 
+
+  GHpos(particles_gh->numParticles(), particles_gh->fieldOffset(), delta*delta_sf,  particles_gh->getDOF(0),particles_gh->getProp("ghid") );
+
+  particlePeriodicity(particles_gh->numParticles(),
+                      particles_gh->fieldOffset(),
+                      xmn,xmx,ymn,ymx,zmn,zmx,
+                      particles_gh->getDOF(0) );
+  particles_gh->migrate();
+
+  GHposBack(particles_gh->numParticles(), particles_gh->fieldOffset(), delta*delta_sf,  particles_gh->getDOF(0),particles_gh->getProp("ghid") );
+  if (nrs->isOutputStep) {
+    particles->writeFld();
+  }
+
+  delete particles_gh;
+  particles_gh = nullptr;
+}

@@ -1,0 +1,361 @@
+//
+// nekRS User Defined File
+//
+
+#include <math.h>
+#include "udf.hpp"
+#include "plugins/lpm.hpp"
+#include "linspaceVector.hpp"
+
+#ifdef __okl__
+#include "eddy.oudf"
+#endif
+
+static dfloat Stk;
+static dlong nParticlesInject;
+static dlong injectionFrequency;
+static occa::memory o_yNewPart; // for adding new particles
+static occa::memory o_propNewPart;
+
+static dfloat xMin;
+static dfloat yMin;
+static dfloat zMin;
+static dfloat xMax;
+static dfloat yMax;
+static dfloat zMax;
+
+static lpm_t *particles = nullptr;
+static lpm_t *particles_gh = nullptr;
+static lpm_t *particles_ms = nullptr;
+
+static int rank;
+static dfloat delta=0.3;
+static dfloat delta2;
+
+void UDF_Setup0(MPI_Comm comm, setupAide &options)
+{
+  int commSize;
+  MPI_Comm_size(comm, &commSize);
+
+  MPI_Comm_rank(comm, &rank);
+  delta2 = delta*delta;
+  platform->par->extract("casedata", "stk", Stk);
+  platform->par->extract("casedata", "nparticlesinject", nParticlesInject);
+  platform->par->extract("casedata", "injectionfrequency", injectionFrequency);
+}
+
+void userRHS(nrs_t *nrs, lpm_t *lpm, dfloat time, occa::memory o_y, void *userdata, occa::memory o_ydot)
+{
+  auto offset = lpm->fieldOffset();
+
+  // evaluate fluid fields at particle positions
+  lpm->interpolate();
+
+  auto o_Uinterp = lpm->getInterpField("fluid_velocity");
+  auto o_projF   = lpm->getProp("forcex");
+
+  if (lpm->numParticles()) {
+    particleRHS(lpm->numParticles(), offset, o_y, lpm->o_prop, o_Uinterp, o_projF, o_ydot);
+  }
+}
+
+void userStRHS(nrs_t *nrs, lpm_t *lpm, dfloat time, occa::memory o_y, void *userdata, occa::memory o_ydot)
+{
+  platform->linAlg->fill(lpm->numParticles()*lpm->nDOFs(), 0.0, o_ydot);
+}
+
+// generate uniform points distributed at inflow
+auto generateInflowPoints(nrs_t *nrs)
+{
+  auto numGlobalParticles = particles->numGlobalParticles();
+
+  std::vector<dfloat> xPart, yPart, zPart;
+
+  auto mesh = nrs->meshV;
+
+  const auto px = 1;
+  const auto py = 1;
+  const auto pz = 1;
+
+  const dfloat xHlf = (xMin + xMax)/2.0;
+
+  for(int i=0; i<px; i++){
+    dfloat x = xMin + (i+0.5)/(1.0*px)*(xMax-xMin)*1.0/9.0;
+  for(int j=0; j<py; j++){
+    dfloat y = yMin + (j+0.5)/(1.0*py)*(yMax-yMin);
+  for(int k=0; k<pz; k++){
+    dfloat z = zMin + (k+0.5)/(1.0*pz)*(zMax-zMin);
+
+    if (x<=xHlf && platform->comm.mpiRank == 0) {
+      xPart.push_back(x);
+      yPart.push_back(y);
+      zPart.push_back(z);
+    }
+    else if(x> xHlf && platform->comm.mpiRank == 1){
+      xPart.push_back(x);
+      yPart.push_back(y);
+      zPart.push_back(z);
+    }
+
+    numGlobalParticles++;
+  }
+  }
+  }
+
+  return std::make_tuple(xPart, yPart, zPart);
+}
+
+void userf(nrs_t *nrs, dfloat time, occa::memory o_U, occa::memory o_FU)
+{
+  mesh_t *mesh = nrs->meshV;
+  fillFU(mesh->Nlocal,
+         nrs->fieldOffset,
+         particles_ms->getProp("mid"),
+         particles_ms->getProp("forcex"),
+         particles_ms->getProp("forcey"),
+         particles_ms->getProp("forcez"),
+         nrs->o_FU);
+}
+
+void UDF_Setup(nrs_t *nrs)
+{
+
+  udf.uEqnSource = &userf;
+  auto *mesh = nrs->meshV;
+
+  xMin = platform->linAlg->min(mesh->Nlocal, mesh->o_x, platform->comm.mpiComm);
+  yMin = platform->linAlg->min(mesh->Nlocal, mesh->o_y, platform->comm.mpiComm);
+  zMin = platform->linAlg->min(mesh->Nlocal, mesh->o_z, platform->comm.mpiComm);
+
+  xMax = platform->linAlg->max(mesh->Nlocal, mesh->o_x, platform->comm.mpiComm);
+  yMax = platform->linAlg->max(mesh->Nlocal, mesh->o_y, platform->comm.mpiComm);
+  zMax = platform->linAlg->max(mesh->Nlocal, mesh->o_z, platform->comm.mpiComm);
+
+  const dfloat newton_tol = 5e-13;
+  const dfloat bb_tol = 1e-4;
+
+  particles = new lpm_t(nrs, bb_tol, newton_tol);
+  particles->setUserRHS(userRHS);
+
+  particles->setSolver("AB");
+
+  // register fluid velocity as an interpolated quantity
+  particles->registerInterpField("fluid_velocity", nrs->NVfields, nrs->o_U);
+
+  // register particle velocity as DOF
+  particles->registerDOF(nrs->NVfields, "velocity");
+
+  // register Stokes number as a property
+  particles->registerProp("stokes_number");
+  particles->registerProp("tid");
+  particles->registerProp("forcex");
+  particles->registerProp("forcey");
+  particles->registerProp("forcez");
+
+  auto [xPart, yPart, zPart] = generateInflowPoints(nrs);
+  const dlong nParticles = xPart.size();
+
+  // interpolate initial fluid velocity onto particle positions
+  std::vector<dfloat> particleU0(nrs->NVfields * nParticles);
+  auto interpolator = pointInterpolation_t(nrs);
+  interpolator.setPoints(nParticles, xPart.data(), yPart.data(), zPart.data());
+  interpolator.find();
+
+  interpolator.eval(nrs->NVfields, nrs->fieldOffset, nrs->U, nParticles, particleU0.data());
+
+  // set particle initial positions and velocities
+  std::vector<dfloat> y0(particles->nDOFs() * nParticles);
+
+  for (int pid = 0; pid < nParticles; ++pid) {
+    const auto x = xPart[pid];
+    const auto y = yPart[pid];
+    const auto z = zPart[pid];
+
+    const auto u = particleU0[pid + 0 * nParticles];
+    const auto v = particleU0[pid + 1 * nParticles];
+    const auto w = particleU0[pid + 2 * nParticles];
+
+    y0[pid + 0 * nParticles] = x;
+    y0[pid + 1 * nParticles] = y;
+    y0[pid + 2 * nParticles] = z;
+
+    y0[pid + 3 * nParticles] = u;
+    y0[pid + 4 * nParticles] = v;
+    y0[pid + 5 * nParticles] = w;
+  }
+
+  dfloat t0;
+  platform->options.getArgs("START TIME", t0);
+  particles->initialize(nParticles, t0, y0);
+
+  // set Stokes number
+  platform->linAlg->fill(nParticles, Stk, particles->o_prop);
+
+
+  // Mesh Points
+  particles_ms = new lpm_t(nrs, bb_tol, newton_tol);
+  particles_ms->setUserRHS(userStRHS);
+  particles_ms->setSolver("AB");
+  particles_ms->registerProp("pid");
+  particles_ms->registerProp("tid");
+  particles_ms->registerProp("mid");
+  particles_ms->registerProp("forcex");
+  particles_ms->registerProp("forcey");
+  particles_ms->registerProp("forcez");
+  
+  const dlong nParticlesms = mesh->Nlocal;
+  std::vector<dfloat> y0ms(particles_ms->nDOFs() * nParticlesms);
+
+  for (int pid = 0; pid < nParticlesms; ++pid) {
+    const auto x = mesh->x[pid];
+    const auto y = mesh->y[pid];
+    const auto z = mesh->z[pid];
+
+    y0ms[pid + 0 * nParticlesms] = x;
+    y0ms[pid + 1 * nParticlesms] = y;
+    y0ms[pid + 2 * nParticlesms] = z;
+  }
+  
+  particles_ms->initialize(nParticlesms, t0, y0ms);
+
+  MeshPID(particles_ms->numParticles(),
+          particles_ms->fieldOffset(),
+          xMin,xMax,yMin,yMax,zMin,zMax,
+          (double) rank,
+          particles_ms->getDOF(0),
+          particles_ms->getProp("pid"),
+          particles_ms->getProp("tid"),
+          particles_ms->getProp("mid"));
+
+}
+
+void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
+{
+
+  auto *mesh = nrs->meshV;
+
+  particles->integrate(time);
+
+  particlePeriodicity(particles->numParticles(),
+                      particles->fieldOffset(),
+                      xMin,xMax,yMin,yMax,zMin,zMax,
+                      particles->getDOF(0) );
+
+  ParticleTID(particles->numParticles(),
+          particles->fieldOffset(),
+          xMin,xMax,yMin,yMax,zMin,zMax,
+          particles->getDOF(0),
+          particles->getProp("tid"));
+
+  particles->migrateTransfer();
+
+  // Ghost Particles creation
+  const dfloat newton_tol = 5e-13;
+  const dfloat bb_tol = 1e-4;
+
+  particles_gh = new lpm_t(nrs, bb_tol, newton_tol);
+  particles_gh->setUserRHS(userStRHS);
+  particles_gh->setSolver("AB");
+  particles_gh->registerProp("tid");
+  particles_gh->registerDOF(nrs->NVfields, "force");
+
+  auto xPartgh = particles->getDOFHost("x");
+  auto yPartgh = particles->getDOFHost("y");
+  auto zPartgh = particles->getDOFHost("z");
+  auto FxPartgh = particles->getPropHost("forcex");
+  auto FyPartgh = particles->getPropHost("forcey");
+  auto FzPartgh = particles->getPropHost("forcez");
+  const dlong nParticles = particles->numParticles();
+
+  // set particle initial positions and velocities
+  std::vector< std::vector<dfloat>> y0gh(particles->nDOFs());
+  std::vector<dfloat> tid;
+
+  const dfloat xHlf = (xMin + xMax)/2.0;
+
+  for (int pid = 0; pid < nParticles; ++pid) {
+    const auto x = xPartgh[pid];
+    const auto y = yPartgh[pid];
+    const auto z = zPartgh[pid];
+
+    if(rank==0 && xHlf-x <= delta*1.5){
+      const auto fx = FxPartgh[pid];
+      const auto fy = FyPartgh[pid];
+      const auto fz = FzPartgh[pid];
+
+      y0gh[0].push_back(x);
+      y0gh[1].push_back(y);
+      y0gh[2].push_back(z);
+  
+      tid.push_back(1.0);
+      y0gh[3].push_back(fx);
+      y0gh[4].push_back(fy);
+      y0gh[5].push_back(fz);
+    }
+    else if(rank==1 && x-xHlf <= delta*1.5){
+      const auto fx = FxPartgh[pid];
+      const auto fy = FyPartgh[pid];
+      const auto fz = FzPartgh[pid];
+      
+      y0gh[0].push_back(x);
+      y0gh[1].push_back(y);
+      y0gh[2].push_back(z);
+      
+      tid.push_back(0.0);
+      y0gh[3].push_back(fx);
+      y0gh[4].push_back(fy);
+      y0gh[5].push_back(fz);
+    }
+  }
+
+  const dlong nParticlesgh = tid.size();
+  std::vector<dfloat> y0gh2;
+
+  for(int i=0; i<6; i++){
+    y0gh2.insert( y0gh2.end(), y0gh[i].begin(), y0gh[i].end() );
+  }
+
+  dfloat t0 = time;
+  particles_gh->initialize(nParticlesgh, t0, y0gh2);
+  particles_gh->o_prop.copyFrom(tid.data(), tid.size() * sizeof(dfloat));
+  particles_gh->migrateTransfer();
+
+  particles_ms->migrateTransfer();
+
+  MeshForce(particles_ms->numParticles(),
+            particles->numParticles(),
+            particles_gh->numParticles(),
+            particles_ms->fieldOffset(),
+            particles->fieldOffset(),
+            particles_gh->fieldOffset(),
+            delta2,
+            particles_ms->getDOF(0),
+            particles->getDOF(0),
+            particles_gh->getDOF(0),
+            particles_ms->getProp("tid"),
+            particles_ms->getProp("pid"),
+            particles_ms->getProp("forcex"),
+            particles->getProp("forcex"),
+            particles_gh->getDOF("force"));
+
+//  particles_ms->migrateTransfer();
+  particles_ms->migrateBack();
+
+//  particles_gh->~lpm_t();
+//  particles_ms->~lpm_t();
+
+  if (nrs->isOutputStep) {
+    particles->writeFld();
+//    particles_gh->writeFld();
+//    particles_ms->writeFld();
+  }
+
+/*
+  if (platform->comm.mpiRank == 0) {   
+    printf("umn = %d, umx = %d, particlevel\n",rank, particles_ms->numParticles());
+  }
+*/
+
+  delete particles_gh;
+  particles_gh = nullptr;
+}
