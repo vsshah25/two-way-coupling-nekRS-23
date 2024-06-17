@@ -26,7 +26,7 @@ One can observe that the particle velocity increases and its effect on neighbour
 
 ### Homogenous Isotropic turbulence
 Here we have a triply periodic box domain with homogenous isotropic turbulence.
-Number of particles = 36*36*36 = 46656
+Number of particles = 36x36x36 = 46656
 Mesh points = 512000
 
 ## Running examples
